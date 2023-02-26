@@ -1,4 +1,4 @@
-# dvr_clean_and_scan
+# DVR AVI files auto clean and scan
 ## Requirements
 requires ffmpeg, open cv and dvr-scan to work.
 
