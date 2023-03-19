@@ -23,7 +23,8 @@ for filename in os.listdir(args.folder):
             print(f"{filename} already exists in the cleaned folder, skipping...")
         else:
             # clean video using ffmpeg
-            subprocess.call(['ffmpeg', '-i', input_path, '-c:v', 'copy', '-c:a', 'copy', output_path])
+            # subprocess.call(['ffmpeg', '-i', input_path, '-c:v', 'copy', '-c:a', 'copy', output_path]) # V1 : only copy
+            subprocess.call(['ffmpeg', '-i', input_path, '-c:v', 'libx264', '-preset', 'fast', '-crf', '21' , output_path]) # V2 reconvert file entirely
 
 # create output folder if it doesn't exist
 output_folder = os.path.join(args.folder, "output")
