@@ -1,9 +1,21 @@
 import argparse
 import logging
+import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+# dvr-scan Python API (bundled by PyInstaller; subprocess fallback used if unavailable)
+try:
+    from dvr_scan.scanner import ScanContext as _ScanContext  # type: ignore
+    _DVR_SCAN_PYTHON_API = True
+except ImportError:  # pragma: no cover
+    _DVR_SCAN_PYTHON_API = False
 
 VIDEO_EXTENSIONS = {".avi", ".mp4", ".mkv"}
 
@@ -30,6 +42,36 @@ class Config:
     kernel_size: int = -1
     # ffmpeg quality (CRF for libx264, equivalent for GPU encoders)
     crf: int = 30
+    # parallel jobs for clean and scan phases
+    workers: int = 1
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg resolution — system binary (GPU-capable) → imageio-ffmpeg fallback (CPU)
+# ---------------------------------------------------------------------------
+
+def _resolve_ffmpeg() -> str:
+    """Return the path to an ffmpeg binary.
+
+    Priority:
+    1. System ffmpeg on PATH — supports GPU encoders (NVENC, AMF, QSV).
+    2. imageio-ffmpeg bundled static binary — CPU only, always available.
+    """
+    system = shutil.which("ffmpeg")
+    if system:
+        log.info("Using system ffmpeg: %s", system)
+        return system
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe  # type: ignore
+        bundled = get_ffmpeg_exe()
+        log.info("System ffmpeg not found — using bundled imageio-ffmpeg (CPU only): %s", bundled)
+        return bundled
+    except ImportError:
+        log.error(
+            "No ffmpeg found. Install ffmpeg (https://ffmpeg.org/download.html) "
+            "or add imageio-ffmpeg to your environment."
+        )
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -44,23 +86,43 @@ _GPU_ENCODERS = [
 ]
 
 
-def _detect_encoder(crf: int) -> tuple[str, list[str], str, str]:
+def _detect_encoder(ffmpeg_bin: str, crf: int) -> tuple[str, list[str], str, str]:
     """Return the best available H.264 encoder as (encoder, hw_flags, quality_flag, quality_value).
-    Falls back to libx264 if no GPU encoder is available."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-encoders", "-loglevel", "quiet"],
-            capture_output=True, text=True, check=False,
+
+    Checking the encoder list is not sufficient — GPU encoders (e.g. h264_nvenc) are
+    compiled into ffmpeg regardless of the hardware present and will appear in the list
+    even on machines that cannot use them.  We therefore run a 1-frame probe through
+    each candidate and only accept it when the probe succeeds.
+    Falls back to libx264 if no GPU encoder is available.
+    """
+    result = subprocess.run(
+        [ffmpeg_bin, "-encoders", "-loglevel", "quiet"],
+        capture_output=True, text=True, check=False,
+    )
+    available = result.stdout
+    for encoder, hw_flags, quality_flag, _ in _GPU_ENCODERS:
+        if encoder not in available:
+            continue
+        # Probe: encode a single synthetic frame to verify the encoder actually works
+        # on this machine's hardware before committing to it.
+        probe = subprocess.run(
+            [
+                ffmpeg_bin, *hw_flags,
+                # 128x128 @ 25 fps: AMD AMF requires at least 128x128 (64x64 triggers
+                # AMF_NOT_SUPPORTED on Radeon iGPUs such as the 780M)
+                "-f", "lavfi", "-i", "color=s=128x128:r=25",
+                "-frames:v", "1",
+                "-c:v", encoder,
+                "-loglevel", "quiet",
+                "-f", "null", "-",
+            ],
+            capture_output=True, check=False,
         )
-        available = result.stdout
-        for encoder, hw_flags, quality_flag, _ in _GPU_ENCODERS:
-            if encoder in available:
-                log.info("GPU encoder detected: %s", encoder)
-                return encoder, hw_flags, quality_flag, str(crf)
-    except FileNotFoundError:
-        log.error("ffmpeg not found in PATH")
-        sys.exit(1)
-    log.info("No GPU encoder found, using libx264 (CPU)")
+        if probe.returncode == 0:
+            log.info("GPU encoder verified: %s", encoder)
+            return encoder, hw_flags, quality_flag, str(crf)
+        log.debug("GPU encoder %s listed but probe failed (no compatible hardware), skipping.", encoder)
+    log.info("No working GPU encoder found, falling back to libx264 (CPU)")
     return "libx264", [], "-crf", str(crf)
 
 
@@ -70,38 +132,54 @@ def _detect_encoder(crf: int) -> tuple[str, list[str], str, str]:
 
 def run_cmd(cmd: list[str], dry_run: bool) -> bool:
     """Run a subprocess command and return True on success."""
-    log.info("Running: %s", " ".join(str(c) for c in cmd))
+    log.debug("Running: %s", " ".join(str(c) for c in cmd))
     if dry_run:
         return True
-    result = subprocess.run(cmd, check=False)
+    try:
+        result = subprocess.run(cmd, check=False, capture_output=True)
+    except FileNotFoundError:
+        log.error("Executable not found: %s — ensure it is installed and on PATH.", cmd[0])
+        return False
     if result.returncode != 0:
         log.error("Command failed with exit code %d", result.returncode)
+        # Surface the last few stderr lines through the logger so tqdm keeps bars stable
+        if result.stderr:
+            for line in result.stderr.decode(errors="replace").splitlines()[-5:]:
+                line = line.strip()
+                if line:
+                    log.error("  ffmpeg: %s", line)
         return False
     return True
 
 
-def clean_videos(cfg: Config, cleaned_folder: Path) -> None:
+def clean_videos(cfg: Config, cleaned_folder: Path, ffmpeg_bin: str) -> None:
     """Re-encode source videos into the cleaned folder."""
     cleaned_folder.mkdir(parents=True, exist_ok=True)
 
-    encoder, hw_flags, quality_flag, quality_value = _detect_encoder(cfg.crf)
-    preset_flags = ["-preset", "ultrafast"] if encoder == "libx264" else ["-preset", "p1"]
-
+    # Check for video files *before* spawning the encoder-detection subprocess.
     video_files = [f for f in cfg.folder.iterdir() if f.suffix.lower() in VIDEO_EXTENSIONS]
     if not video_files:
         log.warning("No video files found in %s", cfg.folder)
         return
 
-    for video_file in sorted(video_files):
+    encoder, hw_flags, quality_flag, quality_value = _detect_encoder(ffmpeg_bin, cfg.crf)
+    _preset_map = {
+        "libx264":    "ultrafast",
+        "h264_nvenc": "p1",       # NVENC fastest preset
+        "h264_amf":   "speed",    # AMF fastest preset
+        "h264_qsv":   "veryfast", # QSV fastest preset
+    }
+    preset_flags = ["-preset", _preset_map.get(encoder, "ultrafast")]
+
+    def _process(video_file: Path) -> None:
         output_path = cleaned_folder / f"cl_{video_file.name}"
         if output_path.exists():
             log.info("%s already cleaned, skipping.", video_file.name)
-            continue
-
+            return
         log.info("Cleaning %s -> %s  [encoder: %s]", video_file.name, output_path.name, encoder)
         run_cmd(
             [
-                "ffmpeg", *hw_flags, "-i", str(video_file),
+                ffmpeg_bin, *hw_flags, "-i", str(video_file),
                 "-c:v", encoder, *preset_flags, quality_flag, quality_value,
                 "-loglevel", "warning",
                 str(output_path),
@@ -109,9 +187,37 @@ def clean_videos(cfg: Config, cleaned_folder: Path) -> None:
             cfg.dry_run,
         )
 
+    with logging_redirect_tqdm():
+        bar = tqdm(total=len(video_files), desc="[1/2] Cleaning", unit="file",
+                   dynamic_ncols=True, leave=True)
+        with ThreadPoolExecutor(max_workers=cfg.workers) as executor:
+            futures = {executor.submit(_process, f): f for f in sorted(video_files)}
+            for future in as_completed(futures):
+                fname = futures[future].name
+                exc = future.exception()
+                if exc:
+                    bar.write(f"[ERROR] {fname}: {exc}")
+                bar.set_postfix_str(fname, refresh=False)
+                bar.update(1)
+        bar.close()
+
+
+def _parse_min_length(duration_str: str, fps: float = 25.0) -> int:
+    """Convert a CLI duration string ('2s', '500ms') to a frame count at the given fps."""
+    s = duration_str.strip().lower()
+    if s.endswith("ms"):
+        return max(1, round(float(s[:-2]) / 1000.0 * fps))
+    if s.endswith("s"):
+        return max(1, round(float(s[:-1]) * fps))
+    return max(1, int(s))  # already a frame count
+
 
 def scan_videos(cfg: Config, cleaned_folder: Path, output_folder: Path) -> None:
-    """Run dvr-scan on all cleaned video files."""
+    """Run dvr-scan motion detection on all cleaned video files.
+
+    Uses the dvr-scan Python API when available (works inside a PyInstaller bundle).
+    Falls back to the 'dvr-scan' CLI subprocess when the Python API is unavailable.
+    """
     output_folder.mkdir(parents=True, exist_ok=True)
 
     video_files = [f for f in cleaned_folder.iterdir() if f.suffix.lower() in VIDEO_EXTENSIONS]
@@ -119,19 +225,78 @@ def scan_videos(cfg: Config, cleaned_folder: Path, output_folder: Path) -> None:
         log.warning("No cleaned video files found in %s", cleaned_folder)
         return
 
-    for video_file in sorted(video_files):
+    min_event_frames = _parse_min_length(cfg.min_event_length)
+
+    if not _DVR_SCAN_PYTHON_API:
+        if not shutil.which("dvr-scan"):
+            log.error(
+                "dvr-scan is not available: Python API import failed and 'dvr-scan' "
+                "executable was not found on PATH. "
+                "Install it with: pip install dvr-scan[opencv]"
+            )
+            return
+
+    def _scan_one(video_file: Path) -> None:
         log.info("Scanning %s", video_file.name)
-        run_cmd(
-            [
-                "dvr-scan", "-i", str(video_file),
-                "-d", str(output_folder),
-                "-t", str(cfg.threshold),
-                "-df", str(cfg.downscale_factor),
-                "-l", cfg.min_event_length,
-                "-k", str(cfg.kernel_size),
-            ],
-            cfg.dry_run,
+        if cfg.dry_run:
+            log.info(
+                "[dry-run] dvr-scan -i %s -d %s -t %s -df %s -l %s -k %s",
+                video_file, output_folder,
+                cfg.threshold, cfg.downscale_factor, cfg.min_event_length, cfg.kernel_size,
+            )
+            return
+        if _DVR_SCAN_PYTHON_API:
+            _scan_with_api(video_file, output_folder, cfg, min_event_frames)
+        else:
+            log.warning("dvr-scan Python API not available — using subprocess fallback.")
+            run_cmd(
+                [
+                    "dvr-scan", "-i", str(video_file),
+                    "-d", str(output_folder),
+                    "-t", str(cfg.threshold),
+                    "-df", str(cfg.downscale_factor),
+                    "-l", cfg.min_event_length,
+                    "-k", str(cfg.kernel_size),
+                ],
+                dry_run=False,
+            )
+
+    with logging_redirect_tqdm():
+        bar = tqdm(total=len(video_files), desc="[2/2] Scanning", unit="file",
+                   dynamic_ncols=True, leave=True)
+
+        def _scan_one_tracked(video_file: Path) -> None:
+            bar.set_postfix_str(f"→ {video_file.name}", refresh=True)
+            _scan_one(video_file)
+
+        with ThreadPoolExecutor(max_workers=cfg.workers) as executor:
+            futures = {executor.submit(_scan_one_tracked, f): f for f in sorted(video_files)}
+            for future in as_completed(futures):
+                fname = futures[future].name
+                exc = future.exception()
+                if exc:
+                    bar.write(f"[ERROR] {fname}: {exc}")
+                bar.update(1)
+                bar.set_postfix_str(f"done: {fname}", refresh=True)
+        bar.close()
+
+
+def _scan_with_api(video_file: Path, output_folder: Path, cfg: Config, min_event_frames: int) -> None:
+    """Invoke dvr-scan via its Python API (PyInstaller-compatible)."""
+    try:
+        scanner = _ScanContext(  # type: ignore[name-defined]
+            input_videos=[str(video_file)],
+            output_dir=str(output_folder),
         )
+        scanner.scan_motion(
+            threshold=cfg.threshold,
+            min_event_len=min_event_frames,
+            downscale_factor=cfg.downscale_factor,
+            kernel_size=cfg.kernel_size,
+        )
+    except (RuntimeError, ValueError, OSError) as exc:
+        log.error("dvr-scan Python API error for %s: %s", video_file.name, exc)
+        log.error("Tip: check that dvr-scan[opencv] is installed and matches the expected API.")
 
 
 def run_pipeline(cfg: Config) -> None:
@@ -140,16 +305,18 @@ def run_pipeline(cfg: Config) -> None:
         log.error("Folder not found: %s", cfg.folder)
         sys.exit(1)
 
+    ffmpeg_bin = _resolve_ffmpeg()
+
     cleaned_folder = cfg.folder / "cleaned"
     output_folder = cfg.folder / "output"
 
-    log.info("=== Step 1/2: Cleaning videos (GPU auto-detect) ===")
-    clean_videos(cfg, cleaned_folder)
+    tqdm.write("\n=== Step 1/2: Cleaning videos (GPU auto-detect) ===")
+    clean_videos(cfg, cleaned_folder, ffmpeg_bin)
 
-    log.info("=== Step 2/2: Scanning for motion ===")
+    tqdm.write("\n=== Step 2/2: Scanning for motion ===")
     scan_videos(cfg, cleaned_folder, output_folder)
 
-    log.info("Done.")
+    tqdm.write("\nDone.")
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +373,7 @@ _PARAM_HINTS = {
     "min_event_length":  ("Min event length",       "2s",    "duration string e.g. 1s, 500ms · default 2s"),
     "kernel_size":       ("Blur kernel size",       "-1",    "odd int or -1 for auto (adapts to resolution) · default -1"),
     "crf":               ("Quality / CRF",          "30",    "int 18–51 · lower = better quality & larger file · default 30"),
+    "workers":           ("Parallel workers",        "1",     "int 1–N · parallel jobs for clean & scan · default 1"),
 }
 
 
@@ -225,6 +393,9 @@ def _wizard_advanced() -> Config:
     print(f"\n  {_YELLOW}━━  ffmpeg parameters  ━━{_RESET}")
     crf = int(_prompt(*_PARAM_HINTS["crf"][:2], _PARAM_HINTS["crf"][2]))
 
+    print(f"\n  {_YELLOW}━━  performance  ━━{_RESET}")
+    workers = int(_prompt(*_PARAM_HINTS["workers"][:2], _PARAM_HINTS["workers"][2]))
+
     return Config(
         folder=folder,
         dry_run=dry_run,
@@ -233,6 +404,7 @@ def _wizard_advanced() -> Config:
         min_event_length=min_event_length,
         kernel_size=kernel_size,
         crf=crf,
+        workers=workers,
     )
 
 
@@ -261,6 +433,7 @@ def _print_summary(cfg: Config) -> None:
     print(f"    Min event length : {cfg.min_event_length}")
     print(f"    Kernel size      : {cfg.kernel_size}")
     print(f"    CRF / quality    : {cfg.crf}")
+    print(f"    Workers          : {cfg.workers}")
     print()
 
 
@@ -294,6 +467,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # ffmpeg tunables
     parser.add_argument("--crf",          type=int,   default=30,   metavar="Q",
                         help="Re-encode quality (18–51). Lower = better quality. Default: 30")
+    parser.add_argument("--workers",      type=int,   default=1,    metavar="N",
+                        help="Parallel jobs for clean and scan phases. Default: 1")
     return parser
 
 
@@ -322,6 +497,7 @@ def main() -> None:
             min_event_length=args.min_length,
             kernel_size=args.kernel,
             crf=args.crf,
+            workers=args.workers,
         )
 
     run_pipeline(cfg)

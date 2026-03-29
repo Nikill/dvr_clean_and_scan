@@ -1,0 +1,4 @@
+# Runtime dependencies — installed by end users and bundled by PyInstaller.
+imageio-ffmpeg>=0.5      # provides a static ffmpeg binary as fallback when system ffmpeg is absent
+dvr-scan[opencv]>=0.6    # motion-detection library + OpenCV
+tqdm>=4.60               # progress bars with logging interleave support
