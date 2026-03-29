@@ -1,0 +1,3 @@
+# Build-time dependencies — includes runtime deps so PyInstaller can bundle everything.
+-r requirements.txt
+pyinstaller>=6.0
