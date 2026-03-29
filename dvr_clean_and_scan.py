@@ -37,7 +37,7 @@ class Config:
     dry_run: bool = False
     # dvr-scan parameters
     threshold: float = 0.75
-    downscale_factor: int = 6
+    downscale_factor: int = 8
     min_event_length: str = "2s"
     kernel_size: int = -1
     # ffmpeg quality (CRF for libx264, equivalent for GPU encoders)
@@ -336,11 +336,86 @@ def _h(text: str) -> str:
     return f"{_BOLD}{_CYAN}{text}{_RESET}"
 
 
+_RED = "\033[31m"
+
+
 def _prompt(label: str, default: str, hint: str = "") -> str:
     """Single-line prompt with default value shown."""
     hint_str = f"  {_DIM}{hint}{_RESET}" if hint else ""
     answer = input(f"  {label} [{_GREEN}{default}{_RESET}]{hint_str}: ").strip()
     return answer if answer else default
+
+
+def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
+    """Prompt for a float in [lo, hi], re-asking on bad input."""
+    default_str = str(default)
+    while True:
+        raw = input(f"  {label} [{_GREEN}{default_str}{_RESET}]  ({lo}–{hi}): ").strip()
+        val_str = raw if raw else default_str
+        try:
+            val = float(val_str)
+            if lo <= val <= hi:
+                return val
+            print(f"  {_RED}✗  Must be between {lo} and {hi}.{_RESET}")
+        except ValueError:
+            print(f"  {_RED}✗  Please enter a number (e.g. 0.75).{_RESET}")
+
+
+def _prompt_int(label: str, default: int, lo: int, hi: int) -> int:
+    """Prompt for an integer in [lo, hi], re-asking on bad input."""
+    default_str = str(default)
+    while True:
+        raw = input(f"  {label} [{_GREEN}{default_str}{_RESET}]  ({lo}–{hi}): ").strip()
+        val_str = raw if raw else default_str
+        try:
+            val = int(val_str)
+            if lo <= val <= hi:
+                return val
+            print(f"  {_RED}✗  Must be between {lo} and {hi}.{_RESET}")
+        except ValueError:
+            print(f"  {_RED}✗  Please enter a whole number.{_RESET}")
+
+
+def _prompt_kernel() -> int:
+    """Prompt for kernel size: -1 (auto) or a positive odd integer."""
+    while True:
+        raw = input(f"  Blur kernel size [{_GREEN}-1{_RESET}]  (-1 for auto, or odd int ≥ 3): ").strip()
+        val_str = raw if raw else "-1"
+        try:
+            val = int(val_str)
+            if val == -1:
+                return val
+            if val >= 3 and val % 2 == 1:
+                return val
+            if val % 2 == 0:
+                print(f"  {_RED}✗  Must be odd (e.g. 3, 5, 7) or -1 for auto.{_RESET}")
+            else:
+                print(f"  {_RED}✗  Must be -1 (auto) or an odd integer ≥ 3.{_RESET}")
+        except ValueError:
+            print(f"  {_RED}✗  Please enter -1 or an odd whole number (e.g. 5).{_RESET}")
+
+
+def _prompt_duration(label: str, default: str) -> str:
+    """Prompt for a duration string like '2s' or '500ms', re-asking on bad input."""
+    import re
+    _DURATION_RE = re.compile(r"^\d+(\.\d+)?(ms|s)$")
+    while True:
+        raw = input(f"  {label} [{_GREEN}{default}{_RESET}]  (e.g. 2s, 500ms): ").strip()
+        val = raw if raw else default
+        if _DURATION_RE.match(val):
+            return val
+        print(f"  {_RED}✗  Enter a duration like '2s' or '500ms'.{_RESET}")
+
+
+def _prompt_folder(default: str) -> Path:
+    """Prompt for a folder path, re-asking until it exists."""
+    while True:
+        raw = input(f"  Recordings folder [{_GREEN}{default}{_RESET}]: ").strip()
+        p = Path(raw).resolve() if raw else Path(default).resolve()
+        if p.is_dir():
+            return p
+        print(f"  {_RED}✗  Folder not found: {p}{_RESET}")
+        print(f"  {_DIM}   Create it first, or enter a different path.{_RESET}")
 
 
 def _confirm(label: str, default: bool = True) -> bool:
@@ -361,40 +436,93 @@ def _print_banner() -> None:
 
 def _wizard_simple() -> Config:
     print(f"\n  {_BOLD}Simple mode{_RESET} — runs with recommended defaults.\n")
-    raw = _prompt("Recordings folder", str(Path.cwd()))
-    folder = Path(raw).resolve()
+    folder = _prompt_folder(str(Path.cwd()))
     dry_run = _confirm("Dry run (preview commands only)?", default=False)
     return Config(folder=folder, dry_run=dry_run)
 
 
 _PARAM_HINTS = {
-    "threshold":         ("Motion threshold",      "0.75",  "float 0.0–1.0 · higher = less sensitive · default 0.75"),
-    "downscale_factor":  ("Downscale factor",       "6",     "int 1–16 · higher = faster but less accurate · default 6"),
-    "min_event_length":  ("Min event length",       "2s",    "duration string e.g. 1s, 500ms · default 2s"),
-    "kernel_size":       ("Blur kernel size",       "-1",    "odd int or -1 for auto (adapts to resolution) · default -1"),
-    "crf":               ("Quality / CRF",          "30",    "int 18–51 · lower = better quality & larger file · default 30"),
-    "workers":           ("Parallel workers",        "1",     "int 1–N · parallel jobs for clean & scan · default 1"),
+    "threshold":         ("Motion threshold",      "0.75",  "float 0.0–1.0"),
+    "downscale_factor":  ("Downscale factor",      "8",     "int 1–16"),
+    "min_event_length":  ("Min event length",      "2s",    "e.g. 1s, 500ms"),
+    "kernel_size":       ("Blur kernel size",      "-1",    "odd int or -1 for auto"),
+    "crf":               ("Quality / CRF",         "30",    "int 18–51"),
+    "workers":           ("Parallel workers",      "1",     "int 1–N"),
 }
+
+_D = _DIM  # shorthand
+
+def _explain(lines: list[str]) -> None:
+    """Print dim explanation lines before a prompt."""
+    for line in lines:
+        print(f"    {_D}{line}{_RESET}")
 
 
 def _wizard_advanced() -> Config:
     print(f"\n  {_BOLD}Advanced mode{_RESET} — configure every parameter.\n")
 
-    raw = _prompt("Recordings folder", str(Path.cwd()))
-    folder = Path(raw).resolve()
+    folder = _prompt_folder(str(Path.cwd()))
     dry_run = _confirm("Dry run (preview commands only)?", default=False)
 
-    print(f"\n  {_YELLOW}━━  dvr-scan parameters  ━━{_RESET}")
-    threshold        = float(_prompt(*_PARAM_HINTS["threshold"][:2],        _PARAM_HINTS["threshold"][2]))
-    downscale_factor = int(_prompt(*_PARAM_HINTS["downscale_factor"][:2],   _PARAM_HINTS["downscale_factor"][2]))
-    min_event_length = _prompt(*_PARAM_HINTS["min_event_length"][:2],        _PARAM_HINTS["min_event_length"][2])
-    kernel_size      = int(_prompt(*_PARAM_HINTS["kernel_size"][:2],         _PARAM_HINTS["kernel_size"][2]))
+    # ── dvr-scan parameters ──────────────────────────────────────────────
+    print(f"\n  {_YELLOW}━━  Motion detection (dvr-scan)  ━━{_RESET}\n")
 
-    print(f"\n  {_YELLOW}━━  ffmpeg parameters  ━━{_RESET}")
-    crf = int(_prompt(*_PARAM_HINTS["crf"][:2], _PARAM_HINTS["crf"][2]))
+    _explain([
+        "How sensitive the detector is to pixel changes between frames.",
+        "↑ higher  →  less sensitive, fewer false positives (shadows, compression noise)",
+        "↓ lower   →  more sensitive, catches subtle motion but more noise",
+        "Typical range: 0.5 (sensitive) – 0.9 (strict)  |  recommended: 0.75",
+    ])
+    threshold = _prompt_float("Motion threshold", 0.75, 0.0, 1.0)
 
-    print(f"\n  {_YELLOW}━━  performance  ━━{_RESET}")
-    workers = int(_prompt(*_PARAM_HINTS["workers"][:2], _PARAM_HINTS["workers"][2]))
+    print()
+    _explain([
+        "Divides frame resolution before analysis  (e.g. 8 → 1080p becomes ~135p).",
+        "↑ higher  →  much faster scan, uses less CPU, slightly less precise",
+        "↓ lower   →  more accurate detection on small/distant motion",
+        "Best speed knob: 6–10 for most DVR footage  |  recommended: 8",
+    ])
+    downscale_factor = _prompt_int("Downscale factor", 8, 1, 16)
+
+    print()
+    _explain([
+        "Minimum duration a motion event must last to be kept.",
+        "↑ longer  →  skips short bursts (compression artefacts, insects, leaves)",
+        "↓ shorter →  catches brief events like a quick hand gesture",
+        "Recommended: 2s for most cameras  |  try 1s for fast-moving scenes",
+    ])
+    min_event_length = _prompt_duration("Min event length", "2s")
+
+    print()
+    _explain([
+        "Size of the Gaussian blur kernel applied before frame comparison.",
+        "-1 (auto)  →  kernel scales automatically with the downscaled resolution",
+        "Larger odd values (e.g. 7, 9)  →  smoother diff, ignores fine grain/noise",
+        "Recommended: -1 (auto) works well in most cases",
+    ])
+    kernel_size = _prompt_kernel()
+
+    # ── ffmpeg parameters ────────────────────────────────────────────────
+    print(f"\n  {_YELLOW}━━  Video re-encoding (ffmpeg)  ━━{_RESET}\n")
+
+    _explain([
+        "CRF (Constant Rate Factor) controls output quality vs. file size.",
+        "↓ lower   →  better quality, larger file  (18 = near-lossless)",
+        "↑ higher  →  smaller file, more compression artefacts",
+        "For surveillance footage 28–32 is usually fine  |  recommended: 30",
+    ])
+    crf = _prompt_int("Quality / CRF", 30, 18, 51)
+
+    # ── performance ──────────────────────────────────────────────────────
+    print(f"\n  {_YELLOW}━━  Performance  ━━{_RESET}\n")
+
+    _explain([
+        "Number of files processed in parallel for both clean and scan phases.",
+        "↑ more workers  →  faster overall, but more CPU/memory pressure",
+        "Set to the number of physical CPU cores for best throughput",
+        "Start with 2–4; going beyond core count rarely helps",
+    ])
+    workers = _prompt_int("Parallel workers", 1, 1, 64)
 
     return Config(
         folder=folder,
