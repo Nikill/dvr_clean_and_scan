@@ -1,0 +1,82 @@
+name: Build binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: dvr_clean_and_scan.exe
+            asset_name: dvr_clean_and_scan-windows-x64.exe
+          - os: macos-latest
+            artifact_name: dvr_clean_and_scan
+            asset_name: dvr_clean_and_scan-macos-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: pip install -r requirements-build.txt
+
+      - name: Build with PyInstaller
+        run: >
+          pyinstaller
+          --onefile
+          --name dvr_clean_and_scan
+          --console
+          dvr_clean_and_scan.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run when a version tag is pushed
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dvr_clean_and_scan-windows-x64.exe
+          path: dist/
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dvr_clean_and_scan-macos-x64
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/dvr_clean_and_scan.exe
+            dist/dvr_clean_and_scan
+          generate_release_notes: true

@@ -1,0 +1,3 @@
+# Build-time dependencies only — not needed at runtime.
+# Used by GitHub Actions and local builds to produce the self-contained binary.
+pyinstaller>=6.0
